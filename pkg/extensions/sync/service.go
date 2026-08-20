@@ -4,6 +4,7 @@ package sync
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
@@ -50,8 +51,8 @@ type BaseService struct {
 	rc               *regclient.RegClient
 	hosts            []config.Host
 	tagsCache        *tagsCache
-	streamManager    stream.Manager
 	checkTracker     *manifestCheckTracker
+	streamManager    stream.Manager
 	prioClient       *regclient.RegClient
 	priorityFetcher  *stream.PriorityFetcher
 
@@ -588,6 +589,10 @@ func (service *BaseService) SyncRepo(ctx context.Context, repo string) error {
 		// periodic sync just validated this tag against upstream, so on-demand requests
 		// arriving right after do not need to check it again.
 		service.markUpstreamChecked(localRepo, tag)
+
+		// periodic sync just validated this tag against upstream, so on-demand requests
+		// arriving right after do not need to check it again.
+		service.markUpstreamChecked(localRepo, tag)
 	}
 
 	service.log.Info().Str("repo", repo).Msg("sync: finished syncing repo")
@@ -980,6 +985,58 @@ func httpRetryDelayBounds(opts syncconf.RegistryConfig) (time.Duration, time.Dur
 	return delayInit, delayMax, true
 }
 
+// effectiveMaxIdleConnsPerHost returns the transport's MaxIdleConnsPerHost setting: the
+// configured override when set, or — when DisableHTTP2 is enabled — reqConcurrent, so the idle
+// pool is sized to match how many HTTP/1.1 connections can actually be in flight (otherwise it
+// stays at Go's default of 2, and connections beyond that get closed instead of pooled, undoing
+// most of DisableHTTP2's benefit under concurrency). Otherwise 0, meaning "leave it at the Go
+// default" (the same value the cloned http.DefaultTransport already carries).
+func effectiveMaxIdleConnsPerHost(opts syncconf.RegistryConfig, reqConcurrent int64) int {
+	if opts.MaxIdleConnsPerHost != nil {
+		return *opts.MaxIdleConnsPerHost
+	}
+
+	if opts.DisableHTTP2 != nil && *opts.DisableHTTP2 {
+		return int(reqConcurrent)
+	}
+
+	return 0
+}
+
+// pinHTTP1ALPN returns tlsConfig with NextProtos pinned to exclude HTTP/2, so ALPN negotiation
+// itself excludes "h2" even if the upstream would otherwise select it (clearing Transport.TLSNextProto
+// alone isn't enough for that). tlsConfig may be nil: http.Transport.Clone() lazily runs Go's own
+// HTTP/2 auto-configuration on its source transport first, which in virtually every real build sets a
+// non-nil TLSClientConfig before Clone() copies it — but that's an internal net/http implementation
+// detail, not a guarantee, so this stays nil-safe rather than assuming it.
+func pinHTTP1ALPN(tlsConfig *tls.Config) *tls.Config {
+	if tlsConfig == nil {
+		// No fields set here diverge from http.DefaultTransport's TLS behavior (e.g. MinVersion
+		// stays at Go's secure default); this only exists as a place to pin NextProtos below.
+		tlsConfig = &tls.Config{} //nolint:gosec
+	}
+
+	tlsConfig.NextProtos = []string{"http/1.1"}
+
+	return tlsConfig
+}
+
+// applySyncTransportOptions applies DisableHTTP2 and MaxIdleConnsPerHost to transport in place.
+// Extracted out of newClient so a unit test can inspect the resulting *http.Transport directly:
+// newClient only returns a *regclient.RegClient, which wraps the transport and doesn't expose it.
+func applySyncTransportOptions(transport *http.Transport, opts syncconf.RegistryConfig, reqConcurrent int64) {
+	// DisableHTTP2: net/http multiplexes every request to a host onto a single HTTP/2 connection,
+	// so all of it shares one TCP congestion window regardless of client-side concurrency. Forcing
+	// HTTP/1.1 makes each concurrent request open its own TCP connection instead.
+	if opts.DisableHTTP2 != nil && *opts.DisableHTTP2 {
+		transport.ForceAttemptHTTP2 = false
+		transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+		transport.TLSClientConfig = pinHTTP1ALPN(transport.TLSClientConfig)
+	}
+
+	transport.MaxIdleConnsPerHost = effectiveMaxIdleConnsPerHost(opts, reqConcurrent)
+}
+
 func newClient(opts syncconf.RegistryConfig, credentials syncconf.CredentialsFile, logger log.Logger,
 	hostMods ...func(*config.Host),
 ) (*regclient.RegClient, []config.Host, error) {
@@ -1007,9 +1064,21 @@ func newClient(opts syncconf.RegistryConfig, credentials syncconf.CredentialsFil
 	hostConfig.Mirrors = mirrorsHosts
 	hostConfig.RepoAuth = true
 
+	// Override regclient's per-host concurrency/rate limits when configured. regclient applies these
+	// limits independently per host: the value set here on the upstream host is also copied onto each
+	// mirror, so the effective cap is per host, not a shared total across the upstream and its mirrors.
+	// When unset, regclient's defaults are kept (ReqConcurrent=3, ReqPerSec=0 i.e. unlimited).
+	if opts.ReqConcurrent != nil {
+		hostConfig.ReqConcurrent = int64(*opts.ReqConcurrent)
+	}
+
+	if opts.ReqPerSec != nil {
+		hostConfig.ReqPerSec = *opts.ReqPerSec
+	}
+
 	// set TLS configuration
-	tls := getTLSConfigOption(urls[0], opts.TLSVerify)
-	hostConfig.TLS = tls
+	tlsConf := getTLSConfigOption(urls[0], opts.TLSVerify)
+	hostConfig.TLS = tlsConf
 
 	if opts.CertDir != "" {
 		clientCert, clientKey, regCert, err := getCertificates(opts.CertDir)
@@ -1087,6 +1156,10 @@ func newClient(opts syncconf.RegistryConfig, credentials syncconf.CredentialsFil
 	// which are separate component timeouts. Doesn't cover body transfer time, which is expected
 	// to be slow for large images.
 	transport.ResponseHeaderTimeout = opts.ResponseHeaderTimeout
+
+	// hostConfig.ReqConcurrent already holds the effective per-host concurrency cap at this point
+	// (regclient's default of 3, from HostNew() above, or opts.ReqConcurrent if it was set).
+	applySyncTransportOptions(transport, opts, hostConfig.ReqConcurrent)
 
 	// Use SyncTimeout for overall HTTP client timeout. This is the maximum time for the entire
 	// HTTP request, covering all stages: DialContext (connection establishment), TLSHandshakeTimeout
