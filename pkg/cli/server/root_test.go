@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -622,15 +623,8 @@ func TestServe(t *testing.T) {
 			contentStr := string(content)
 			tmpFile := MakeTempFileWithContent(t, "zot-test.json", contentStr)
 
-			os.Args = []string{"cli_test", "serve", tmpFile}
-
-			err := cli.NewServerRootCmd().Execute()
+			err := tryInitControllerFromConfigFile(t, tmpFile)
 			So(err, ShouldNotBeNil)
-
-			// wait for the config reloader goroutine to start watching the config file
-			// if we end the test too fast it will delete the config file
-			// which will cause a panic and mark the test run as a failure
-			time.Sleep(1 * time.Second)
 		})
 	})
 }
@@ -2010,6 +2004,115 @@ storage:
 		So(err, ShouldNotBeNil)
 	})
 
+	Convey("Test verify with non-positive sync reqConcurrent", t, func(c C) {
+		content := `{"storage":{"rootDirectory":"/tmp/zot"},
+							"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+							"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+							"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+							"reqConcurrent": 0}]}}}`
+		tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+
+		os.Args = []string{"cli_test", "verify", tmpfile}
+		err := cli.NewServerRootCmd().Execute()
+		So(err, ShouldNotBeNil)
+	})
+
+	Convey("Test verify with non-positive sync reqPerSec", t, func(c C) {
+		content := `{"storage":{"rootDirectory":"/tmp/zot"},
+							"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+							"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+							"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+							"reqPerSec": 0}]}}}`
+		tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+
+		os.Args = []string{"cli_test", "verify", tmpfile}
+		err := cli.NewServerRootCmd().Execute()
+		So(err, ShouldNotBeNil)
+	})
+
+	Convey("Test verify rejects non-finite sync reqPerSec", t, func(c C) {
+		// JSON can't express NaN/Inf, so use YAML where `.nan`/`.inf` are valid floats that
+		// would otherwise slip past a naive `<= 0` check.
+		for _, badValue := range []string{".nan", ".inf", "-.inf"} {
+			content := `
+storage:
+  rootDirectory: /tmp/zot
+http:
+  address: 127.0.0.1
+  port: "8080"
+  realm: zot
+  auth:
+    htpasswd:
+      path: test/data/htpasswd
+    failDelay: 1
+extensions:
+  sync:
+    registries:
+      - urls:
+          - localhost:9999
+        reqPerSec: ` + badValue
+			tmpfile := MakeTempFileWithContent(t, "zot-test.yaml", content)
+
+			os.Args = []string{"cli_test", "verify", tmpfile}
+			err := cli.NewServerRootCmd().Execute()
+			So(err, ShouldNotBeNil)
+		}
+	})
+
+	Convey("Test verify with valid sync reqConcurrent and reqPerSec", t, func(c C) {
+		content := `{"storage":{"rootDirectory":"/tmp/zot"},
+							"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+							"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+							"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+							"reqConcurrent": 30, "reqPerSec": 100}]}}}`
+		tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+
+		os.Args = []string{"cli_test", "verify", tmpfile}
+		err := cli.NewServerRootCmd().Execute()
+		So(err, ShouldBeNil)
+	})
+
+	Convey("Test verify with non-positive sync maxIdleConnsPerHost", t, func(c C) {
+		content := `{"storage":{"rootDirectory":"/tmp/zot"},
+							"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+							"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+							"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+							"maxIdleConnsPerHost": 0}]}}}`
+		tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+
+		os.Args = []string{"cli_test", "verify", tmpfile}
+		err := cli.NewServerRootCmd().Execute()
+		So(err, ShouldNotBeNil)
+	})
+
+	Convey("Test verify with valid sync disableHTTP2 and maxIdleConnsPerHost", t, func(c C) {
+		content := `{"storage":{"rootDirectory":"/tmp/zot"},
+							"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+							"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+							"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+							"reqConcurrent": 16, "disableHTTP2": true, "maxIdleConnsPerHost": 30}]}}}`
+		tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+
+		os.Args = []string{"cli_test", "verify", tmpfile}
+		err := cli.NewServerRootCmd().Execute()
+		So(err, ShouldBeNil)
+	})
+
+	Convey("Test verify with disableHTTP2 and maxIdleConnsPerHost omitted", t, func(c C) {
+		// newClient defaults the idle pool to reqConcurrent in this case (see service.go), so
+		// verify must not require maxIdleConnsPerHost to be set alongside disableHTTP2.
+		content := `{"storage":{"rootDirectory":"/tmp/zot"},
+							"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+							"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+							"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+							"disableHTTP2": true}]}}}`
+		tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+
+		os.Args = []string{"cli_test", "verify", tmpfile}
+		err := cli.NewServerRootCmd().Execute()
+		So(err, ShouldBeNil)
+	})
+
 	Convey("Test verify with good sync content config", t, func(c C) {
 		content := `{"storage":{"rootDirectory":"/tmp/zot"},
 							"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
@@ -3316,16 +3419,14 @@ func TestUpdateLDAPConfig(t *testing.T) {
 
 		configPath := MakeTempFileWithContent(t, "config.json", configStr)
 
-		server := cli.NewServerRootCmd()
-		server.SetArgs([]string{"serve", configPath})
-		So(server.Execute(), ShouldNotBeNil)
+		err := cli.LoadConfiguration(config.New(), configPath)
+		So(err, ShouldNotBeNil)
 
-		err := os.Chmod(ldapConfigPath, 0o600)
+		err = os.Chmod(ldapConfigPath, 0o600)
 		So(err, ShouldBeNil)
 
-		server = cli.NewServerRootCmd()
-		server.SetArgs([]string{"serve", configPath})
-		So(server.Execute(), ShouldNotBeNil)
+		err = cli.LoadConfiguration(config.New(), configPath)
+		So(err, ShouldNotBeNil)
 	})
 
 	Convey("unauthenticated LDAP config", t, func() {
@@ -3492,27 +3593,56 @@ func runCLIWithConfig(t *testing.T, config string) (string, string, error) {
 
 	cfgfile := MakeTempFileWithContent(t, "zot-test.json", config)
 
-	os.Args = []string{"cli_test", "serve", cfgfile}
-
-	// Run CLI in a goroutine, but handle errors via a channel
-	errCh := make(chan error, 1)
-
-	go func() {
-		errCh <- cli.NewServerRootCmd().Execute()
-	}()
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			return "", "", err
-		}
-	case <-time.After(250 * time.Millisecond): // No startup error
+	if err := startServerFromConfigFile(t, cfgfile); err != nil {
+		return "", "", err
 	}
 
-	baseURL := WaitForKernelChosenPortBaseURL(logPath)
-	WaitTillServerReady(baseURL)
-
 	return logPath, rootDir, nil
+}
+
+// tryInitControllerFromConfigFile loads config and initializes a controller without
+// starting the HTTP server. InitController shuts down partial init on failure.
+func tryInitControllerFromConfigFile(t *testing.T, cfgPath string) error {
+	t.Helper()
+
+	conf := config.New()
+	if err := cli.LoadConfiguration(conf, cfgPath); err != nil {
+		return err
+	}
+
+	_, _, err := cli.InitController(conf, cfgPath)
+
+	return err
+}
+
+// startServerFromConfigFile loads config, starts a hot-reloading controller, and
+// registers shutdown on both Convey Reset (per-case) and t.Cleanup (test end).
+func startServerFromConfigFile(t *testing.T, cfgPath string) error {
+	t.Helper()
+
+	conf := config.New()
+	if err := cli.LoadConfiguration(conf, cfgPath); err != nil {
+		return err
+	}
+
+	ctlr, hotReloader, err := cli.InitController(conf, cfgPath)
+	if err != nil {
+		return err
+	}
+
+	ctrlManager := NewControllerManager(ctlr)
+	go ctrlManager.RunServer()
+
+	stop := sync.OnceFunc(func() {
+		hotReloader.Stop()
+		ctlr.Shutdown()
+	})
+	t.Cleanup(stop)
+	Reset(stop)
+
+	ctrlManager.WaitServerReady()
+
+	return nil
 }
 
 func TestRetentionDelayDefaults(t *testing.T) {
